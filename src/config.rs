@@ -121,6 +121,24 @@ impl Config {
     pub fn sell_compute_unit_price_microlamports(&self, cu_limit: u32) -> u64 {
         compute_unit_price_for_fee(self.sell_priority_fees, cu_limit)
     }
+
+    /// Check if a given processor endpoint is enabled (has API key configured).
+    ///
+    /// Helius and StandardRpc are always enabled.
+    /// Other processors require their respective API keys to be set.
+    pub fn is_processor_enabled(&self, processor: &str) -> bool {
+        match processor {
+            "Helius" => true,
+            "StandardRpc" => !self.rpc_url.trim().is_empty(),
+            "Astralane" => !self.astralane_api_key.trim().is_empty(),
+            "Blockrazor" => !self.blockrazor_api_key.trim().is_empty(),
+            "Stellium" => !self.stellium_api_key.trim().is_empty(),
+            "Flashblock" => !self.flashblock_api_key.trim().is_empty(),
+            "ZeroSlot" => !self.zero_slot_api_key.trim().is_empty(),
+            "Nozomi" => !self.nozomi_api_key.trim().is_empty(),
+            _ => false,
+        }
+    }
 }
 
 fn compute_unit_price_for_fee(fee: f64, cu_limit: u32) -> u64 {
@@ -406,6 +424,64 @@ mod tests {
         );
         assert_eq!(config.buy_tx_tip_lamports(), sol_to_lamports(0.005));
         assert_eq!(config.sell_tx_tip_lamports(), sol_to_lamports(0.006));
+    }
+
+    #[test]
+    fn processor_enabled_checks() {
+        // Start with empty config - only Helius should be enabled (no API key needed)
+        let mut config = sample_config();
+
+        // Helius is always enabled
+        assert!(config.is_processor_enabled("Helius"));
+
+        // StandardRpc requires rpc_url
+        assert!(!config.is_processor_enabled("StandardRpc"));
+        config.rpc_url = "http://example.com".to_string();
+        assert!(config.is_processor_enabled("StandardRpc"));
+
+        // Other processors require their respective API keys
+        assert!(!config.is_processor_enabled("Astralane"));
+        config.astralane_api_key = "test-key".to_string();
+        assert!(config.is_processor_enabled("Astralane"));
+
+        assert!(!config.is_processor_enabled("Blockrazor"));
+        config.blockrazor_api_key = "test-key".to_string();
+        assert!(config.is_processor_enabled("Blockrazor"));
+
+        assert!(!config.is_processor_enabled("Stellium"));
+        config.stellium_api_key = "test-key".to_string();
+        assert!(config.is_processor_enabled("Stellium"));
+
+        assert!(!config.is_processor_enabled("Flashblock"));
+        config.flashblock_api_key = "test-key".to_string();
+        assert!(config.is_processor_enabled("Flashblock"));
+
+        assert!(!config.is_processor_enabled("ZeroSlot"));
+        config.zero_slot_api_key = "test-key".to_string();
+        assert!(config.is_processor_enabled("ZeroSlot"));
+
+        assert!(!config.is_processor_enabled("Nozomi"));
+        config.nozomi_api_key = "test-key".to_string();
+        assert!(config.is_processor_enabled("Nozomi"));
+
+        // Unknown processor should return false
+        assert!(!config.is_processor_enabled("Unknown"));
+    }
+
+    #[test]
+    fn processor_enabled_ignores_whitespace() {
+        let mut config = sample_config();
+
+        // Whitespace-only keys should not enable processor
+        config.astralane_api_key = "   ".to_string();
+        assert!(!config.is_processor_enabled("Astralane"));
+
+        config.astralane_api_key = "\t\n".to_string();
+        assert!(!config.is_processor_enabled("Astralane"));
+
+        // Key with actual content should enable
+        config.astralane_api_key = "  valid-key  ".to_string();
+        assert!(config.is_processor_enabled("Astralane"));
     }
 }
 

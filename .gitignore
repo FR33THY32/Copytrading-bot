@@ -1,1 +1,16 @@
+# Build artifacts
 target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+*.env.local
+
+# Debug dumps
+*.dump
+grpc_dumps/

@@ -3516,10 +3516,13 @@ impl CopyTradeRuntime {
         let cu_limit = signal.protocol.cu_limit(signal.observed_cu_consumed);
         let fee_schedule = self.fee_schedule_for_signal(signal, cu_limit);
         let (slot_index, plan) = self.reserve_plan(cu_limit, fee_schedule)?;
-        let tips = signal
+
+        // Filter processors to only those that are enabled (have API keys configured)
+        let tips: Vec<_> = signal
             .protocol
             .processors()
             .iter()
+            .filter(|processor| self.config.is_processor_enabled(processor.as_str()))
             .map(|processor| {
                 (
                     *processor,
@@ -3527,6 +3530,20 @@ impl CopyTradeRuntime {
                 )
             })
             .collect();
+
+        if tips.is_empty() {
+            warn!(
+                "No transaction processors enabled for {:?} execution",
+                signal.protocol
+            );
+            return Err(CopyTradeExecError::NoProcessorAccepted);
+        }
+
+        debug!(
+            "Prepared execution with {} enabled processors: {:?}",
+            tips.len(),
+            tips.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>()
+        );
 
         Ok(PreparedExecution {
             protocol: signal.protocol,
