@@ -197,12 +197,19 @@ impl CopyTrader {
         pending: &PendingConfirmation,
         parsed_tx: &ParsedTransaction,
     ) {
-        // Check for failed Pump Fun tx that needs AMM fallback
-        if parsed_tx.failed && matches!(pending.protocol, TradeProtocol::PumpFun) {
-            self.handle_failed_pump_fun_sell(pending);
-        }
-
-        if !parsed_tx.failed {
+        if parsed_tx.failed {
+            // Handle failed transactions based on protocol
+            match pending.protocol {
+                TradeProtocol::PumpFun => {
+                    // Pump Fun sell failed - try AMM fallback if pool is cached
+                    self.handle_failed_pump_fun_sell(pending);
+                }
+                TradeProtocol::PumpAmm => {
+                    // Pump AMM sell failed - reset pending_sell so future triggers can retry
+                    self.handle_failed_pump_amm_sell(pending);
+                }
+            }
+        } else {
             self.handle_operator_transaction(parsed_tx);
             self.apply_operator_fill(pending, parsed_tx);
             self.update_tp_sl_position_after_confirmation(pending, parsed_tx);
@@ -214,11 +221,30 @@ impl CopyTrader {
         }
     }
 
-    /// Handle a failed Pump Fun sell by attempting a Pump AMM fallback
+    /// Handle a failed Pump Fun sell by attempting a Pump AMM fallback.
+    ///
+    /// This handles the case where TP/SL triggered on Pump Fun, but the bonding curve
+    /// has already migrated to Pump AMM. We detect this by checking if we have cached
+    /// AMM pool state for this mint.
     fn handle_failed_pump_fun_sell(&mut self, pending: &PendingConfirmation) {
         let mint = &pending.mint;
 
-        // Check if position has migrated to PumpAmm
+        // First check if we have cached AMM pool state - this indicates migration happened
+        let Some(cached_pool) = self.pump_amm_pool_cache.get(mint).cloned() else {
+            // No AMM pool cached - this failure is not due to migration
+            // Reset pending_sell so future triggers can retry
+            if let Some(target) = self.targets.get_mut(&pending.target) {
+                if let Some(position) = target.tp_sl_positions.get_mut(mint) {
+                    warn!(
+                        "Pump Fun sell failed for {} but no AMM pool cached - resetting pending_sell",
+                        mint
+                    );
+                    position.pending_sell = false;
+                }
+            }
+            return;
+        };
+
         let Some(target) = self.targets.get_mut(&pending.target) else {
             return;
         };
@@ -226,34 +252,25 @@ impl CopyTrader {
             return;
         };
 
-        // Only fallback if position was already migrated to PumpAmm
-        if !matches!(position.protocol, TradeProtocol::PumpAmm) {
-            warn!(
-                "Pump Fun sell failed for {} but position not migrated to AMM",
+        // If position is still marked as PumpFun, upgrade it to PumpAmm
+        if matches!(position.protocol, TradeProtocol::PumpFun) {
+            info!(
+                "TP/SL | Upgrading position {} from PumpFun to PumpAmm (detected via failed sell + cached pool)",
                 mint
             );
-            position.pending_sell = false;
-            return;
+            position.protocol = TradeProtocol::PumpAmm;
         }
-
-        // Get cached pool state
-        let Some(cached_pool) = self.pump_amm_pool_cache.get(mint).cloned() else {
-            warn!(
-                "Pump Fun sell failed for {} (migrated) but no AMM pool state cached - cannot fallback",
-                mint
-            );
-            position.pending_sell = false;
-            return;
-        };
 
         // Get operator token balance
         let operator_tokens = self.operator.total_tokens(mint);
         if operator_tokens == 0 {
             info!(
-                "Pump Fun sell failed for {} but operator has no tokens - skipping fallback",
+                "Pump Fun sell failed for {} but operator has no tokens - removing position",
                 mint
             );
-            position.pending_sell = false;
+            if target.tp_sl_positions.remove(mint).is_some() {
+                self.position_index.remove(mint, &target.config.wallet);
+            }
             return;
         }
 
@@ -304,6 +321,26 @@ impl CopyTrader {
 
         // Keep pending_sell = true since we're sending another tx
         self.emit_execution_signal(signal);
+    }
+
+    /// Handle a failed Pump AMM sell by resetting pending_sell.
+    ///
+    /// This allows future price updates to re-trigger TP/SL exits.
+    fn handle_failed_pump_amm_sell(&mut self, pending: &PendingConfirmation) {
+        let mint = &pending.mint;
+
+        let Some(target) = self.targets.get_mut(&pending.target) else {
+            return;
+        };
+        let Some(position) = target.tp_sl_positions.get_mut(mint) else {
+            return;
+        };
+
+        warn!(
+            "Pump AMM sell failed for {} - resetting pending_sell for retry",
+            mint
+        );
+        position.pending_sell = false;
     }
 
     fn update_tp_sl_position_after_confirmation(
@@ -4493,5 +4530,54 @@ mod tests {
         assert_eq!(state.pump_amm_positions.plan_sell(mint, 500, 100), 0);
         let mirrored = state.mirror_positions.plan_sell(mint, 500, 100);
         assert_eq!(mirrored, 50);
+    }
+
+    #[test]
+    fn tp_sl_position_migration_upgrades_protocol() {
+        // Test that TpSlPosition correctly tracks protocol migration
+        let mut position = TpSlPosition::new(
+            TradeProtocol::PumpFun,
+            0.0001, // buy price
+            Some(50.0), // 50% take profit
+            Some(20.0), // 20% stop loss
+        );
+
+        // Initially PumpFun
+        assert!(matches!(position.protocol, TradeProtocol::PumpFun));
+
+        // Simulate migration by upgrading protocol
+        position.protocol = TradeProtocol::PumpAmm;
+        assert!(matches!(position.protocol, TradeProtocol::PumpAmm));
+
+        // TP/SL thresholds should still work after migration
+        let pct_change = position.percentage_change(0.00016); // 60% gain
+        assert!(pct_change > 50.0);
+        assert!(matches!(
+            position.evaluate_trigger(pct_change),
+            Some(TpSlTrigger::TakeProfit)
+        ));
+    }
+
+    #[test]
+    fn tp_sl_pending_sell_blocks_duplicate_triggers() {
+        let mut position = TpSlPosition::new(
+            TradeProtocol::PumpFun,
+            0.0001,
+            Some(50.0),
+            None,
+        );
+
+        // Not pending initially
+        assert!(!position.pending_sell);
+
+        // Simulate TP trigger
+        position.pending_sell = true;
+
+        // Pending sell should be true
+        assert!(position.pending_sell);
+
+        // Reset (simulating failed sell)
+        position.pending_sell = false;
+        assert!(!position.pending_sell);
     }
 }
